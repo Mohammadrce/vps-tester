@@ -9,6 +9,7 @@ import json
 import asyncio
 import aiohttp
 import ipaddress
+import base64
 import re
 import sys
 import time
@@ -86,8 +87,9 @@ HOSTING_ASNS = {
 class ShodanHunter:
     BASE_URL = "https://api.shodan.io"
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, proxy: str = None):
         self.api_key = api_key
+        self.proxy = proxy
         self.session = None
         self._retry_count = 0
 
@@ -106,7 +108,7 @@ class ShodanHunter:
         url = f"{self.BASE_URL}{endpoint}"
 
         try:
-            async with session.get(url, params=params) as resp:
+            async with session.get(url, params=params, proxy=self.proxy) as resp:
                 if resp.status == 200:
                     return await resp.json()
                 elif resp.status == 401:
@@ -187,9 +189,10 @@ class ShodanHunter:
 class CensysHunter:
     BASE_URL = "https://search.censys.io/api/v2"
 
-    def __init__(self, api_id: str, api_secret: str):
+    def __init__(self, api_id: str, api_secret: str, proxy: str = None):
         self.api_id = api_id
         self.api_secret = api_secret
+        self.proxy = proxy
         self.session = None
 
     async def _get_session(self):
@@ -213,7 +216,7 @@ class CensysHunter:
             }
             if cursor: params["cursor"] = cursor
             try:
-                async with session.get(f"{self.BASE_URL}/hosts/search", params=params) as resp:
+                async with session.get(f"{self.BASE_URL}/hosts/search", params=params, proxy=self.proxy) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         hits = data.get("result", {}).get("hits", [])
@@ -248,9 +251,94 @@ class CensysHunter:
         if self.session:
             await self.session.close()
 
+# ─── FOFA Hunter ───────────────────────────────────────────
+class FofaHunter:
+    BASE_URL = "https://fofa.info/api/v1/search/all"
+
+    def __init__(self, email: str, key: str, proxy: str = None):
+        self.email = email
+        self.key = key
+        self.proxy = proxy
+        self.session = None
+
+    async def _get_session(self):
+        if self.session is None:
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+                connector=aiohttp.TCPConnector(ssl=False)
+            )
+        return self.session
+
+    async def search(self, query: str, limit: int = 100) -> List[dict]:
+        session = await self._get_session()
+        qbase64 = base64.b64encode(query.encode()).decode()
+        
+        params = {
+            "email": self.email,
+            "key": self.key,
+            "qbase64": qbase64,
+            "size": limit,
+            "fields": "ip,port,protocol,host,domain,os,country_name,org,isp"
+        }
+        
+        results = []
+        try:
+            async with session.get(self.BASE_URL, params=params, proxy=self.proxy) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("error"):
+                        p(C.R, f"  [!] FOFA API Error: {data.get('errmsg')}")
+                        return []
+                    
+                    results = data.get("results", [])
+                    p(C.D, f"    FOFA: Found {len(results)} results")
+                    
+                    # Convert FOFA format to standard format
+                    std_results = []
+                    for r in results:
+                        if len(r) >= 9:
+                            ip, port, proto, host, domain, os, country, org, isp = r
+                            std_results.append({
+                                "ip": ip,
+                                "port": int(port) if port.isdigit() else port,
+                                "protocol": proto,
+                                "host": host or domain,
+                                "os": os,
+                                "country": country,
+                                "org": org,
+                                "isp": isp
+                            })
+                    return std_results
+                elif resp.status == 401:
+                    p(C.R, "  [!] Invalid FOFA API key/email")
+                else:
+                    p(C.R, f"  [!] FOFA error {resp.status}")
+        except Exception as e:
+            p(C.R, f"  [!] FOFA request failed: {e}")
+            
+        return []
+
+    async def search_vps(self, provider: str = None, country: str = None, limit: int = 100) -> List[dict]:
+        parts = ['port="22"']
+        if provider and provider in HOSTING_ASNS:
+            asn_list = HOSTING_ASNS[provider]
+            asn_q = " || ".join(f'asn="{asn.replace("AS", "")}"' for asn in asn_list)
+            parts.append(f"({asn_q})")
+        if country:
+            parts.append(f'country="{country.upper()}"')
+            
+        query = " && ".join(parts)
+        p(C.D, f"    FOFA Query: {query}")
+        return await self.search(query, limit)
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+
 # ─── ASN Expander (memory‑efficient) ──────────────────────
 class ASNExpander:
-    def __init__(self):
+    def __init__(self, proxy: str = None):
+        self.proxy = proxy
         self.session = None
         self.cache: Dict[str, List[str]] = {}
 
@@ -274,7 +362,7 @@ class ASNExpander:
         ]
         for url in sources:
             try:
-                async with session.get(url) as resp:
+                async with session.get(url, proxy=self.proxy) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if "data" in data and "prefixes" in data["data"]:
@@ -504,7 +592,8 @@ class TargetHunter:
         self.output = OutputManager("targets")
         self.shodan = None
         self.censys = None
-        self.asn_expander = ASNExpander()
+        self.fofa = None
+        self.asn_expander = ASNExpander(proxy=args.proxy)
         self.all_targets: List[dict] = []
 
     def _extract_ips_from_shodan(self, results: List[dict]) -> List[dict]:
@@ -546,12 +635,31 @@ class TargetHunter:
             })
         return targets
 
+    def _extract_ips_from_fofa(self, results: List[dict]) -> List[dict]:
+        targets = []
+        for r in results:
+            ip = r.get("ip")
+            if not ip: continue
+            
+            port = r.get("port")
+            ports = [{"port": port, "protocol": r.get("protocol", "tcp"), "state": "open"}] if port else []
+            
+            targets.append({
+                "ip": ip, "ports": ports,
+                "hostname": r.get("host", ""),
+                "org": r.get("org", ""), "isp": r.get("isp", ""),
+                "location": r.get("country", ""),
+                "os": r.get("os", ""), "product": "",
+                "source": "fofa",
+            })
+        return targets
+
     async def run_shodan(self) -> List[dict]:
         if not self.args.shodan_key:
             return []
         p(C.BOLD, "\n[*] Source: Shodan")
         p(C.D, "─" * 40)
-        self.shodan = ShodanHunter(self.args.shodan_key)
+        self.shodan = ShodanHunter(self.args.shodan_key, proxy=self.args.proxy)
         raw = []
         if self.args.shodan_query:
             p(C.B, f"  [*] Query: {self.args.shodan_query}")
@@ -572,11 +680,29 @@ class TargetHunter:
             return []
         p(C.BOLD, "\n[*] Source: Censys")
         p(C.D, "─" * 40)
-        self.censys = CensysHunter(self.args.censys_id, self.args.censys_secret)
+        self.censys = CensysHunter(self.args.censys_id, self.args.censys_secret, proxy=self.args.proxy)
         raw = await self.censys.search_vps(self.args.provider, self.args.country, self.args.limit)
         await self.censys.close()
         targets = self._extract_ips_from_censys(raw)
         p(C.G, f"  [+] Censys: {len(targets)} unique targets")
+        return targets
+
+    async def run_fofa(self) -> List[dict]:
+        if not self.args.fofa_email or not self.args.fofa_key:
+            return []
+        p(C.BOLD, "\n[*] Source: FOFA")
+        p(C.D, "─" * 40)
+        self.fofa = FofaHunter(self.args.fofa_email, self.args.fofa_key, proxy=self.args.proxy)
+        raw = []
+        if self.args.fofa_query:
+            p(C.B, f"  [*] Query: {self.args.fofa_query}")
+            raw = await self.fofa.search(self.args.fofa_query, self.args.limit)
+        else:
+            p(C.B, f"  [*] General VPS (country: {self.args.country or 'any'})")
+            raw = await self.fofa.search_vps(self.args.provider, self.args.country, self.args.limit)
+        await self.fofa.close()
+        targets = self._extract_ips_from_fofa(raw)
+        p(C.G, f"  [+] FOFA: {len(targets)} unique targets")
         return targets
 
     async def run_asn(self) -> List[dict]:
@@ -632,6 +758,8 @@ class TargetHunter:
         if shodan_t: sources.append(shodan_t)
         censys_t = await self.run_censys()
         if censys_t: sources.append(censys_t)
+        fofa_t = await self.run_fofa()
+        if fofa_t: sources.append(fofa_t)
 
         if not sources:
             p(C.Y, """
@@ -641,6 +769,9 @@ class TargetHunter:
     --shodan-query QUERY     Custom Shodan query
     --censys-id ID           Censys API ID
     --censys-secret SECRET   Censys API Secret
+    --fofa-email EMAIL       FOFA Email
+    --fofa-key KEY           FOFA API key
+    --fofa-query QUERY       Custom FOFA query
     --provider NAME          Known provider
     --asn ASN1,ASN2,...      Custom ASN list
     --country CC             Country code
@@ -648,9 +779,10 @@ class TargetHunter:
     --sample-rate FLOAT      ASN sample rate
     --probe                  Verify alive
     --probe-ports PORTS      Ports for probing
+    --proxy URL              Proxy for API requests (http://...)
   Examples:
     python target_hunter.py --shodan-key KEY --country DE --limit 500
-    python target_hunter.py --provider Hetzner --sample-rate 0.01 --probe
+    python target_hunter.py --fofa-email a@b.c --fofa-key KEY --provider Hetzner
 """)
             return
 
@@ -716,6 +848,9 @@ def main():
     parser.add_argument("--shodan-query", help="Custom Shodan query")
     parser.add_argument("--censys-id", help="Censys API ID")
     parser.add_argument("--censys-secret", help="Censys API Secret")
+    parser.add_argument("--fofa-email", help="FOFA Email")
+    parser.add_argument("--fofa-key", help="FOFA API Key")
+    parser.add_argument("--fofa-query", help="Custom FOFA query")
     parser.add_argument("--provider", help="Provider name")
     parser.add_argument("--asn", help="ASN list")
     parser.add_argument("--country", help="Country code")
@@ -723,6 +858,7 @@ def main():
     parser.add_argument("--sample-rate", type=float, default=0.001, help="ASN sample rate")
     parser.add_argument("--probe", action="store_true", help="Verify alive")
     parser.add_argument("--probe-ports", default="22,80,443", help="Probe ports")
+    parser.add_argument("--proxy", help="HTTP proxy for API requests (e.g., http://127.0.0.1:8080)")
     args = parser.parse_args()
 
     hunter = TargetHunter(args)

