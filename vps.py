@@ -345,6 +345,7 @@ class ProgressDisplay:
 class WordlistManager:
     def __init__(self):
         self._cache: Dict[str, List[Tuple[str, str]]] = {}
+        self._custom_wordlist_cache: Optional[List[Tuple[str, str]]] = None
 
     def load_file_stream(self, path: str) -> Iterator[Tuple[str, str]]:
         """Stream wordlist line by line to save memory."""
@@ -399,14 +400,20 @@ class WordlistManager:
         return CREDENTIALS_DB.get("ssh_root", [])
 
     def get_creds_stream(self, protocol: str, service: str = "", custom_path: str = None) -> Iterator[Tuple[str, str]]:
-        """Stream credentials; if custom_path given, yield from file, else from built‑in."""
+        """Stream credentials; if custom_path given, yield from file (cached in memory), else from built‑in."""
         if custom_path:
-            filepath = Path(custom_path)
-            if filepath.exists():
-                yield from self.load_file_stream(custom_path)
-                return
-            else:
-                cprint(Colors.RED, f"  [!] Wordlist not found: {custom_path}")
+            if self._custom_wordlist_cache is None:
+                filepath = Path(custom_path)
+                if filepath.exists():
+                    self._custom_wordlist_cache = list(self.load_file_stream(custom_path))
+                    cprint(Colors.GREEN, f"  [+] Loaded {len(self._custom_wordlist_cache)} combos into cache")
+                else:
+                    cprint(Colors.RED, f"  [!] Wordlist not found: {custom_path}")
+                    self._custom_wordlist_cache = []
+            
+            for u, p in self._custom_wordlist_cache:
+                yield u, p
+            return
 
         # Use built‑in list
         creds = self.get_creds(protocol, service, None)
@@ -419,8 +426,8 @@ class WordlistManager:
 
 class NetworkUtils:
     @staticmethod
-    def parse_targets(target_str: str) -> List[str]:
-        targets = []
+    def count_targets(target_str: str) -> int:
+        count = 0
         if target_str.startswith('@'):
             filepath = target_str[1:]
             if Path(filepath).exists():
@@ -428,15 +435,55 @@ class NetworkUtils:
                     for line in f:
                         line = line.strip()
                         if line and not line.startswith('#'):
-                            targets.extend(NetworkUtils.parse_targets(line))
-                return list(set(targets))
+                            count += NetworkUtils.count_targets(line)
+        elif '/' in target_str:
+            try:
+                network = ipaddress.ip_network(target_str, strict=False)
+                # hosts() excludes network/broadcast
+                count += max(1, network.num_addresses - 2)
+            except ValueError:
+                count += 1
+        elif '-' in target_str:
+            parts = target_str.split('-')
+            if len(parts) == 2:
+                try:
+                    start_str = parts[0].strip()
+                    end_str = parts[1].strip()
+                    start_ip = ipaddress.ip_address(start_str)
+                    if '.' in end_str:
+                        end_ip = ipaddress.ip_address(end_str)
+                    else:
+                        octets = start_str.split('.')
+                        octets[-1] = end_str
+                        end_ip = ipaddress.ip_address('.'.join(octets))
+                    count += int(end_ip) - int(start_ip) + 1
+                except ValueError:
+                    count += 1
+            else:
+                count += 1
+        else:
+            count += 1
+        return count
+
+    @staticmethod
+    def parse_targets(target_str: str) -> Iterator[str]:
+        if target_str.startswith('@'):
+            filepath = target_str[1:]
+            if Path(filepath).exists():
+                with open(filepath, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith('#'):
+                            yield from NetworkUtils.parse_targets(line)
+                return
 
         if '/' in target_str:
             try:
                 network = ipaddress.ip_network(target_str, strict=False)
-                targets = [str(ip) for ip in network.hosts()]
+                for ip in network.hosts():
+                    yield str(ip)
             except ValueError:
-                targets.append(target_str)
+                yield target_str
 
         elif '-' in target_str:
             parts = target_str.split('-')
@@ -454,19 +501,18 @@ class NetworkUtils:
                     current = int(start_ip)
                     end = int(end_ip)
                     while current <= end:
-                        targets.append(str(ipaddress.ip_address(current)))
+                        yield str(ipaddress.ip_address(current))
                         current += 1
                 except ValueError:
-                    targets.append(target_str)
+                    yield target_str
         else:
             try:
                 resolved = socket.gethostbyname(target_str)
                 if resolved != target_str:
                     cprint(Colors.DIM, f"  [*] {target_str} -> {resolved}")
-                targets.append(resolved)
+                yield resolved
             except socket.gaierror:
-                targets.append(target_str)
-        return targets
+                yield target_str
 
     @staticmethod
     def detect_protocol(port: int) -> str:
@@ -670,6 +716,9 @@ class SSHCracker:
                 except Exception:
                     stats.errors += 1
         return None
+
+    def close(self):
+        self.executor.shutdown(wait=False)
 
 # ──────────────────────────────────────────────────────────────
 # HTTP PANEL CRACKER (with session reuse)
@@ -880,6 +929,9 @@ class FTPCracker:
                     return result
         return None
 
+    def close(self):
+        self.executor.shutdown(wait=False)
+
 # ──────────────────────────────────────────────────────────────
 # DATABASE CRACKER
 # ──────────────────────────────────────────────────────────────
@@ -970,6 +1022,9 @@ class DatabaseCracker:
             stats.attempts += 1
             return await loop.run_in_executor(self.executor, try_redis)
 
+    def close(self):
+        self.executor.shutdown(wait=False)
+
 # ──────────────────────────────────────────────────────────────
 # MAIN ORCHESTRATOR
 # ──────────────────────────────────────────────────────────────
@@ -1027,6 +1082,9 @@ class VPSHunter:
                     f"{result.username}:{result.password} | {result.panel_name} | {result.timestamp}\n")
             self.output_file.write(line)
             self.output_file.flush()
+        if hasattr(self, 'output_json_file') and self.output_json_file:
+            self.output_json_file.write(json.dumps(result.to_dict()) + "\n")
+            self.output_json_file.flush()
 
     def _print_cracked(self, result: CrackResult):
         panel_info = f" ({result.panel_name})" if result.panel_name else ""
@@ -1101,9 +1159,9 @@ class VPSHunter:
         print_banner()
 
         cprint(Colors.CYAN, f"[*] Parsing targets: {self.args.target}")
-        targets = NetworkUtils.parse_targets(self.args.target)
-        self.stats.total_ips = len(targets)
-        cprint(Colors.GREEN, f"[+] {len(targets)} targets loaded")
+        self.stats.total_ips = NetworkUtils.count_targets(self.args.target)
+        targets_iter = NetworkUtils.parse_targets(self.args.target)
+        cprint(Colors.GREEN, f"[+] {self.stats.total_ips} targets counted")
         cprint(Colors.DIM, f"[*] Ports: {self._parse_ports(self.args.ports)}")
         cprint(Colors.DIM, f"[*] Scan timeout: {self.args.timeout}s | Crack timeout: {self.args.crack_timeout}s")
 
@@ -1113,10 +1171,13 @@ class VPSHunter:
         self.output_file.write(f"# VPS Hunter Results - {datetime.now()}\n")
         self.output_file.write(f"# Target: {self.args.target}\n")
         self.output_file.write("#" + "=" * 60 + "\n\n")
+        
+        json_path = output_path.replace('.txt', '.jsonl')
+        self.output_json_file = open(json_path, 'w')
 
         cprint(Colors.BOLD, "\n[*] Phase 1: Network Scan")
         cprint(Colors.DIM, "─" * 40)
-        scan_results = await self.scanner.scan_network(targets, self.stats, self.progress)
+        scan_results = await self.scanner.scan_network(targets_iter, self.stats, self.progress)
 
         cprint(Colors.GREEN, f"\n[+] Scan complete: {len(scan_results)} open ports found")
         if not scan_results:
@@ -1145,6 +1206,12 @@ class VPSHunter:
 
         self._print_summary(output_path)
         self.output_file.close()
+        if hasattr(self, 'output_json_file') and self.output_json_file:
+            self.output_json_file.close()
+            
+        self.ssh_cracker.close()
+        self.ftp_cracker.close()
+        self.db_cracker.close()
         await self.http_cracker.close()
 
     def _print_summary(self, output_path: str):
@@ -1162,10 +1229,8 @@ class VPSHunter:
         print("-" * 50)
         cprint(Colors.CYAN, f"  Results saved to: {output_path}")
         if self.results:
-            json_path = output_path.replace('.txt', '.json')
-            with open(json_path, 'w') as f:
-                json.dump([r.to_dict() for r in self.results], f, indent=2)
-            cprint(Colors.CYAN, f"  JSON export:      {json_path}")
+            json_path = output_path.replace('.txt', '.jsonl')
+            cprint(Colors.CYAN, f"  JSONL export:     {json_path}")
         print("=" * 50)
 
 # ──────────────────────────────────────────────────────────────

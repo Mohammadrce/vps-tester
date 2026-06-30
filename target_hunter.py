@@ -300,8 +300,12 @@ class ASNExpander:
         """Stream IPs without materialising full /16s."""
         all_ips = set()
         for asn in asns:
+            if len(all_ips) >= 100000:
+                break
             prefixes = await self.get_asn_prefixes(asn)
             for pref in prefixes:
+                if len(all_ips) >= 100000:
+                    break
                 try:
                     net = ipaddress.ip_network(pref, strict=False)
                     # Iterate hosts lazily
@@ -317,12 +321,14 @@ class ASNExpander:
                             if count % step == 0:
                                 all_ips.add(str(ip))
                             count += 1
-                            if len(all_ips) > 100000:  # safety limit
+                            if len(all_ips) >= 100000:  # safety limit
                                 break
                     else:
                         # Take all
                         for ip in host_iter:
                             all_ips.add(str(ip))
+                            if len(all_ips) >= 100000:
+                                break
                 except Exception:
                     continue
             await asyncio.sleep(0.3)
